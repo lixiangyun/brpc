@@ -17,8 +17,9 @@ else
     LDD=ldd
 fi
 
-TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog -n 'config_brpc' -- "$@"`
+TEMP=`getopt -o v: --long headers:,libs:,cc:,cxx:,with-glog,nodebugsymbols -n 'config_brpc' -- "$@"`
 WITH_GLOG=0
+DEBUGSYMBOLS=-g
 
 if [ $? != 0 ] ; then >&2 $ECHO "Terminating..."; exit 1 ; fi
 
@@ -33,6 +34,7 @@ while true; do
         --cc ) CC=$2; shift 2 ;;
         --cxx ) CXX=$2; shift 2 ;;
         --with-glog ) WITH_GLOG=1; shift 1 ;;
+        --nodebugsymbols ) DEBUGSYMBOLS=; shift 1 ;;
         -- ) shift; break ;;
         * ) break ;;
     esac
@@ -62,7 +64,7 @@ if [ -z "$HDRS_IN" ] || [ -z "$LIBS_IN" ]; then
 fi
 
 find_dir_of_lib() {
-    local lib=$(find ${LIBS_IN} -name "lib${1}.a" -o -name "lib${1}.$SO" | head -n1)
+    local lib=$(find ${LIBS_IN} -name "lib${1}.a" -o -name "lib${1}.$SO" 2>/dev/null | head -n1)
     if [ ! -z "$lib" ]; then
         dirname $lib
     fi
@@ -82,7 +84,7 @@ find_bin() {
     if [ ! -z "$TARGET_BIN" ]; then
         $ECHO $TARGET_BIN
     else
-        find ${LIBS_IN} -name "$1" | head -n1
+        find ${LIBS_IN} -name "$1" 2>/dev/null | head -n1
     fi
 }
 find_bin_or_die() {
@@ -117,7 +119,7 @@ find_dir_of_header_or_die() {
 
 # Inconvenient to check these headers in baidu-internal
 #PTHREAD_HDR=$(find_dir_of_header_or_die pthread.h)
-#OPENSSL_HDR=$(find_dir_of_header_or_die openssl/ssl.h)
+OPENSSL_HDR=$(find_dir_of_header_or_die openssl/ssl.h)
 
 STATIC_LINKINGS=
 DYNAMIC_LINKINGS="-lpthread -lrt -lssl -lcrypto -ldl -lz"
@@ -173,7 +175,7 @@ fi
 PROTOBUF_HDR=$(find_dir_of_header_or_die google/protobuf/message.h)
 LEVELDB_HDR=$(find_dir_of_header_or_die leveldb/db.h)
 
-HDRS=$($ECHO "$GFLAGS_HDR\n$PROTOBUF_HDR\n$LEVELDB_HDR" | sort | uniq)
+HDRS=$($ECHO "$GFLAGS_HDR\n$PROTOBUF_HDR\n$LEVELDB_HDR\n$OPENSSL_HDR" | sort | uniq)
 LIBS=$($ECHO "$GFLAGS_LIB\n$PROTOBUF_LIB\n$LEVELDB_LIB\n$SNAPPY_LIB" | sort | uniq)
 
 absent_in_the_list() {
@@ -216,6 +218,7 @@ append_to_output_linkings() {
 }
 
 #can't use \n in texts because sh does not support -e
+append_to_output "SYSTEM=$SYSTEM"
 append_to_output "HDRS=$($ECHO $HDRS)"
 append_to_output "LIBS=$($ECHO $LIBS)"
 append_to_output "PROTOC=$PROTOC"
@@ -225,6 +228,14 @@ append_to_output "CXX=$CXX"
 append_to_output "GCC_VERSION=$GCC_VERSION"
 append_to_output "STATIC_LINKINGS=$STATIC_LINKINGS"
 append_to_output "DYNAMIC_LINKINGS=$DYNAMIC_LINKINGS"
+CPPFLAGS="-DBRPC_WITH_GLOG=$WITH_GLOG -DGFLAGS_NS=$GFLAGS_NS"
+if [ ! -z "$DEBUGSYMBOLS" ]; then
+    CPPFLAGS="${CPPFLAGS} $DEBUGSYMBOLS"
+fi
+if [ "$SYSTEM" = "Darwin" ]; then
+    CPPFLAGS="${CPPFLAGS} -Wno-deprecated-declarations"
+fi
+append_to_output "CPPFLAGS=${CPPFLAGS}"
 
 append_to_output "ifeq (\$(NEED_LIBPROTOC), 1)"
 PROTOC_LIB=$(find $PROTOBUF_LIB -name "libprotoc.*" | head -n1)
@@ -241,14 +252,6 @@ else
 fi
 append_to_output "endif"
 
-# Check libunwind (required by tcmalloc and glog)
-UNWIND_LIB=$(find_dir_of_lib unwind)
-HAS_STATIC_UNWIND=""
-if [ -f $UNWIND_LIB/libunwind.a ]; then
-    HAS_STATIC_UNWIND="yes"
-fi
-REQUIRE_UNWIND=""
-
 OLD_HDRS=$HDRS
 OLD_LIBS=$LIBS
 append_to_output "ifeq (\$(NEED_GPERFTOOLS), 1)"
@@ -258,74 +261,24 @@ if [ -z "$TCMALLOC_LIB" ]; then
     append_to_output "    \$(error \"Fail to find gperftools\")"
 else
     append_to_output_libs "$TCMALLOC_LIB" "    "
-    if [ -f $TCMALLOC_LIB/libtcmalloc_and_profiler.a ]; then
-        if [ -f $TCMALLOC_LIB/libtcmalloc.$SO ]; then
-            $LDD $TCMALLOC_LIB/libtcmalloc.$SO > libtcmalloc.deps
-            if grep -q libunwind libtcmalloc.deps; then
-                TCMALLOC_REQUIRE_UNWIND="yes"
-                REQUIRE_UNWIND="yes"
-            fi
-        fi
-        if [ -z "$TCMALLOC_REQUIRE_UNWIND" ]; then
-            append_to_output "    STATIC_LINKINGS+=-ltcmalloc_and_profiler"
-        elif [ ! -z "$HAS_STATIC_UNWIND" ]; then
-            append_to_output "    STATIC_LINKINGS+=-ltcmalloc_and_profiler -lunwind"
-            if grep -q liblzma libtcmalloc.deps; then
-                LZMA_LIB=$(find_dir_of_lib lzma)
-                if [ ! -z "$LZMA_LIB" ]; then
-                    append_to_output_linkings $LZMA_LIB lzma "    "
-                fi
-            fi
-        else
-            append_to_output "    DYNAMIC_LINKINGS+=-ltcmalloc_and_profiler"
-        fi
-        rm -f libtcmalloc.deps
-    else
+    if [ -f $TCMALLOC_LIB/libtcmalloc.$SO ]; then
         append_to_output "    DYNAMIC_LINKINGS+=-ltcmalloc_and_profiler"
+    else
+        append_to_output "    STATIC_LINKINGS+=-ltcmalloc_and_profiler"
     fi
 fi
 append_to_output "endif"
 
 if [ $WITH_GLOG != 0 ]; then
-    GLOG_LIB=$(find_dir_of_lib glog)
+    GLOG_LIB=$(find_dir_of_lib_or_die glog)
     GLOG_HDR=$(find_dir_of_header_or_die glog/logging.h windows/glog/logging.h)
-    append_to_output_headers "$GLOG_HDR" "    "
-    if [ -z "$GLOG_LIB" ]; then
-        append_to_output "    \$(error \"Fail to find glog\")"
+    append_to_output_libs "$GLOG_LIB"
+    append_to_output_headers "$GLOG_HDR"
+    if [ -f "$GLOG_LIB/libglog.$SO" ]; then
+        append_to_output "DYNAMIC_LINKINGS+=-lglog"
     else
-        append_to_output_libs "$GLOG_LIB" "    "
-        if [ -f $GLOG_LIB/libglog.a ]; then
-            if [ -f "$GLOG_LIB/libglog.$SO" ]; then
-                $LDD $GLOG_LIB/libglog.$SO > libglog.deps
-                if grep -q libunwind libglog.deps; then
-                    GLOG_REQUIRE_UNWIND="yes"
-                    REQUIRE_UNWIND="yes"
-                fi
-            fi
-            if [ -z "$GLOG_REQUIRE_UNWIND" ]; then
-                append_to_output "STATIC_LINKINGS+=-lglog"
-            elif [ ! -z "$HAS_STATIC_UNWIND" ]; then
-                append_to_output "STATIC_LINKINGS+=-lglog -lunwind"
-                if grep -q liblzma libglog.deps; then
-                    LZMA_LIB=$(find_dir_of_lib lzma)
-                    if [ ! -z "$LZMA_LIB" ]; then
-                        append_to_output_linkings $LZMA_LIB lzma
-                    fi
-                fi
-            else
-                append_to_output "DYNAMIC_LINKINGS+=-lglog"
-            fi
-        else
-            append_to_output "DYNAMIC_LINKINGS+=-lglog"
-        fi
-        rm -f libglog.deps
+        append_to_output "STATIC_LINKINGS+=-lglog"
     fi
-fi
-append_to_output "CPPFLAGS+=-DBRPC_WITH_GLOG=$WITH_GLOG -DGFLAGS_NS=$GFLAGS_NS"
-
-
-if [ ! -z "$REQUIRE_UNWIND" ]; then
-    append_to_output_libs "$UNWIND_LIB" "    "
 fi
 
 # required by UT

@@ -19,6 +19,7 @@
 #include "butil/logging.h"                       // CHECK
 #include "butil/time.h"                          // cpuwide_time_us
 #include "butil/fd_utility.h"                    // make_non_blocking
+#include "bthread/bthread.h"                     // bthread_start_background
 #include "bthread/unstable.h"                   // bthread_flush
 #include "bvar/bvar.h"                          // bvar::Adder
 #include "brpc/options.pb.h"               // ProtocolType
@@ -86,7 +87,7 @@ ParseResult InputMessenger::CutInputMessage(
             // The protocol is fixed at client-side, no need to try others.
             LOG(ERROR) << "Fail to parse response from " << m->remote_side()
                        << " by " << _handlers[preferred].name 
-                       << " (client's protocol)";
+                       << " at client-side";
             return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
         }
         // Clear context before trying next protocol which probably has
@@ -173,7 +174,6 @@ void InputMessenger::OnNewMessages(Socket* m) {
     //   is batched(notice the BTHREAD_NOSIGNAL and bthread_flush).
     // - Verify will always be called in this bthread at most once and before
     //   any process.
-    
     InputMessenger* messenger = static_cast<InputMessenger*>(m->user());
     const InputMessageHandler* handlers = messenger->_handlers;
     int progress = Socket::PROGRESS_INIT;
@@ -301,9 +301,9 @@ void InputMessenger::OnNewMessages(Socket* m) {
                     if (handlers[index].verify(msg.get())) {
                         m->SetAuthentication(0);
                     } else {
-                        m->SetAuthentication(EAUTH);
+                        m->SetAuthentication(ERPCAUTH);
                         LOG(WARNING) << "Fail to authenticate " << *m;
-                        m->SetFailed(EAUTH, "Fail to authenticate %s",
+                        m->SetFailed(ERPCAUTH, "Fail to authenticate %s",
                                      m->description().c_str());
                         return;
                     }

@@ -1,3 +1,5 @@
+[English version](../en/client.md)
+
 # 示例程序
 
 Echo的[client端代码](https://github.com/brpc/brpc/blob/master/example/echo_c++/client.cpp)。
@@ -94,6 +96,18 @@ BNS是百度内常用的名字服务，比如bns://rdev.matrix.all，其中"bns"
 
 连接一个域名下所有的机器, 例如http://www.baidu.com:80 ，注意连接单点的Init（两个参数）虽然也可传入域名，但只会连接域名下的一台机器。
 
+### consul://\<service-name\>
+
+通过consul获取服务名称为service-name的服务列表。consul的默认地址是localhost:8500，可通过gflags设置-consul\_agent\_addr来修改。consul的连接超时时间默认是200ms，可通过-consul\_connect\_timeout\_ms来修改。
+
+默认在consul请求参数中添加[stale](https://www.consul.io/api/index.html#consistency-modes)和passing（仅返回状态为passing的服务列表），可通过gflags中-consul\_url\_parameter改变[consul请求参数](https://www.consul.io/api/health.html#parameters-2)。
+
+除了对consul的首次请求，后续对consul的请求都采用[long polling](https://www.consul.io/api/index.html#blocking-queries)的方式，即仅当服务列表更新或请求超时后consul才返回结果，这里超时时间默认为60s，可通过-consul\_blocking\_query\_wait\_secs来设置。
+
+若consul返回的服务列表[响应格式](https://www.consul.io/api/health.html#sample-response-2)有错误，或者列表中所有服务都因为地址、端口等关键字段缺失或无法解析而被过滤，consul naming server会拒绝更新服务列表，并在一段时间后（默认500ms，可通过-consul\_retry\_interval\_ms设置）重新访问consul。
+
+如果consul不可访问，服务可自动降级到file naming service获取服务列表。此功能默认关闭，可通过设置-consul\_enable\_degrade\_to\_file\_naming\_service来打开。服务列表文件目录通过-consul \_file\_naming\_service\_dir来设置，使用service-name作为文件名。该文件可通过consul-template生成，里面会保存consul不可用之前最新的下游服务节点。当consul恢复时可自动恢复到consul naming service。
+
 ### 名字服务过滤器
 
 当名字服务获得机器列表后，可以自定义一个过滤器进行筛选，最后把结果传递给负载均衡：
@@ -149,6 +163,10 @@ int main() {
 ### rr
 
 即round robin，总是选择列表中的下一台服务器，结尾的下一台是开头，无需其他设置。比如有3台机器a,b,c，那么brpc会依次向a, b, c, a, b, c, ...发送请求。注意这个算法的前提是服务器的配置，网络条件，负载都是类似的。
+
+### wrr
+
+即weighted round robin, 根据服务器列表配置的权重值来选择服务器。服务器被选到的机会正比于其权重值，并且该算法能保证同一服务器被选到的结果较均衡的散开。
 
 ### random
 
@@ -426,6 +444,10 @@ Controller的特点：
    - 同步RPC前Controller放栈上，出作用域后自行析构。注意异步RPC的Controller绝对不能放栈上，否则其析构时异步调用很可能还在进行中，从而引发未定义行为。
    - 异步RPC前new Controller，done中删除。
 
+## 线程数
+
+和大部分的RPC框架不同，brpc中并没有独立的Client线程池。所有Channel和Server通过[bthread](http://wiki.baidu.com/display/RPC/bthread)共享相同的线程池. 如果你的程序同样使用了brpc的server, 仅仅需要设置Server的线程数。 或者可以通过[gflags](http://wiki.baidu.com/display/RPC/flags)设置[-bthread_concurrency](http://brpc.baidu.com:8765/flags/bthread_concurrency)来设置全局的线程数.
+
 ## 超时
 
 **ChannelOptions.timeout_ms**是对应Channel上所有RPC的总超时，Controller.set_timeout_ms()可修改某次RPC的值。单位毫秒，默认值1秒，最大值2^31（约24天），-1表示一直等到回复或错误。
@@ -598,8 +620,69 @@ baidu_std和hulu_pbrpc协议支持附件，这段数据由用户自定义，不�
 
 在http协议中，附件对应[message body](http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html)，比如要POST的数据就设置在request_attachment()中。
 
+## 开启SSL
+
+要开启SSL，首先确保代码依赖了最新的openssl库。如果openssl版本很旧，会有严重的安全漏洞，支持的加密算法也少，违背了开启SSL的初衷。然后设置`ChannelOptions.ssl_options`，具体见[ssl_option.h](https://github.com/brpc/brpc/blob/master/src/brpc/ssl_option.h)。
+
+```c++
+// SSL options at client side
+struct ChannelSSLOptions {
+    // Whether to enable SSL on the channel.
+    // Default: false
+    bool enable;
+    
+    // Cipher suites used for SSL handshake.
+    // The format of this string should follow that in `man 1 cipers'.
+    // Default: "DEFAULT"
+    std::string ciphers;
+    
+    // SSL protocols used for SSL handshake, separated by comma.
+    // Available protocols: SSLv3, TLSv1, TLSv1.1, TLSv1.2
+    // Default: TLSv1, TLSv1.1, TLSv1.2
+    std::string protocols;
+    
+    // When set, fill this into the SNI extension field during handshake,
+    // which can be used by the server to locate the right certificate. 
+    // Default: empty
+    std::string sni_name;
+    
+    // Options used to verify the server's certificate
+    // Default: see above
+    VerifyOptions verify;
+    
+    // ... Other options
+};
+```
+
+- 目前只有连接单点的Channel可以开启SSL访问，使用了名字服务的Channel**不支持开启SSL**。
+- 开启后，该Channel上任何协议的请求，都会被SSL加密后发送。如果希望某些请求不加密，需要额外再创建一个Channel。
+- 针对HTTPS做了些易用性优化：`Channel.Init`时能自动识别https://前缀，自动开启SSL；-http_verbose时也会输出证书信息。
+
 ## 认证
-TODO: Describe how authentication methods are extended.
+
+client端的认证一般分为2种：
+
+1. 基于请求的认证：每次请求都会带上认证信息。这种方式比较灵活，认证信息中可以含有本次请求中的字段，但是缺点是每次请求都会需要认证，性能上有所损失
+2. 基于连接的认证：当TCP连接建立后，client发送认证包，认证成功后，后续该连接上的请求不再需要认证。相比前者，这种方式灵活度不高（一般ren认证包里只能携带本机一些静态信息），但性能较好，一般用于单连接/连接池场景
+
+针对第一种认证场景，在实现上非常简单，将认证的格式定义加到请求结构体中，每次当做正常RPC发送出去即可；针对第二种场景，brpc提供了一种机制，只要用户继承实现：
+
+```c++
+class Authenticator {
+public:
+    virtual ~Authenticator() {}
+
+    // Implement this method to generate credential information
+    // into `auth_str' which will be sent to `VerifyCredential'
+    // at server side. This method will be called on client side.
+    // Returns 0 on success, error code otherwise
+    virtual int GenerateCredential(std::string* auth_str) const = 0;
+};
+```
+
+那么当用户并发调用RPC接口用单连接往同一个server发请求时，框架会自动保证：建立TCP连接后，连接上的第一个请求中会带有上述`GenerateCredential`产生的认证包，其余剩下的并发请求不会带有认证信息，依次排在第一个请求之后。整个发送过程依旧是并发的，并不会等第一个请求先返回。若server端认证成功，那么所有请求都能成功返回；若认证失败，一般server端则会关闭连接，这些请求则会收到相应错误。
+
+目前自带协议中支持客户端认证的有：[baidu_std](baidu_std.md)(默认协议), HTTP, hulu_pbrpc, ESP。对于自定义协议，一般可以在组装请求阶段，调用Authenticator接口生成认证串，来支持客户端认证。
 
 ## 重置
 

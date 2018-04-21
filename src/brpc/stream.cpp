@@ -81,7 +81,6 @@ int Stream::Create(const StreamOptions &options,
         return -1;
     }
     bthread::ExecutionQueueOptions q_opt;
-    q_opt.max_tasks_size = options.messages_in_batch;
     q_opt.bthread_attr 
         = FLAGS_usercode_in_pthread ? BTHREAD_ATTR_PTHREAD : BTHREAD_ATTR_NORMAL;
     if (bthread::execution_queue_start(&s->_consumer_queue, &q_opt, Consume, s) != 0) {
@@ -160,9 +159,9 @@ void Stream::WriteToHostSocket(butil::IOBuf* b) {
     BRPC_HANDLE_EOVERCROWDED(_host_socket->Write(b));
 }
 
-ssize_t Stream::CutMessageIntoSSLChannel(butil::IOBuf*, SSL*, int* error) {
+ssize_t Stream::CutMessageIntoSSLChannel(SSL*, butil::IOBuf**, size_t) {
     CHECK(false) << "Stream does support SSL";
-    *error = SSL_ERROR_SSL;
+    errno = EINVAL;
     return -1;
 }
 

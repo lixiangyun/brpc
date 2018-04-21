@@ -19,17 +19,17 @@
 #include <inttypes.h>
 #include <google/protobuf/descriptor.h>
 #include <gflags/gflags.h>
-#include "butil/time.h"                               // milliseconds_from_now
+#include "butil/time.h"                              // milliseconds_from_now
 #include "butil/logging.h"
 #include "bthread/unstable.h"                        // bthread_timer_add
-#include "brpc/socket_map.h"                    // SocketMapInsert
+#include "brpc/socket_map.h"                         // SocketMapInsert
 #include "brpc/compress.h"
 #include "brpc/global.h"
 #include "brpc/span.h"
 #include "brpc/details/load_balancer_with_naming.h"
 #include "brpc/controller.h"
 #include "brpc/channel.h"
-#include "brpc/details/usercode_backup_pool.h"  // TooManyUserCode
+#include "brpc/details/usercode_backup_pool.h"       // TooManyUserCode
 #include "brpc/policy/esp_authenticator.h"
 
 
@@ -62,7 +62,9 @@ Channel::Channel(ProfilerLinker)
 
 Channel::~Channel() {
     if (_server_id != (SocketId)-1) {
-        SocketMapRemove(_server_address);
+        SocketMapRemove(SocketMapKey(_server_address,
+                                     _options.ssl_options,
+                                     _options.auth));
     }
 }
 
@@ -121,6 +123,15 @@ int Channel::InitChannelOptions(const ChannelOptions* options) {
         if (_options.auth == NULL) {
             _options.auth = policy::global_esp_authenticator();
         }
+    } else if (_options.protocol == brpc::PROTOCOL_HTTP) {
+        if (_raw_server_address.compare(0, 5, "https") == 0) {
+            _options.ssl_options.enable = true;
+            if (_options.ssl_options.sni_name.empty()) {
+                int port;
+                ParseHostAndPortFromURL(_raw_server_address.c_str(),
+                                        &_options.ssl_options.sni_name, &port);
+            }
+        }
     }
 
     return 0;
@@ -152,6 +163,7 @@ int Channel::Init(const char* server_addr_and_port,
             return -1;
         }
     }
+    _raw_server_address.assign(server_addr_and_port);
     return Init(point, options);
 }
 
@@ -174,6 +186,7 @@ int Channel::Init(const char* server_addr, int port,
             return -1;
         }
     }
+    _raw_server_address.assign(server_addr);
     return Init(point, options);
 }
 
@@ -189,7 +202,9 @@ int Channel::Init(butil::EndPoint server_addr_and_port,
         return -1;
     }
     _server_address = server_addr_and_port;
-    if (SocketMapInsert(server_addr_and_port, &_server_id) != 0) {
+    if (SocketMapInsert(SocketMapKey(server_addr_and_port,
+                                     _options.ssl_options,
+                                     _options.auth), &_server_id) != 0) {
         LOG(ERROR) << "Fail to insert into SocketMap";
         return -1;
     }
@@ -234,33 +249,6 @@ static void HandleBackupRequest(void* arg) {
     bthread_id_error(correlation_id, EBACKUPREQUEST);
 }
 
-static void* RunDone(void* arg) {
-    static_cast<google::protobuf::Closure*>(arg)->Run();
-    return NULL;
-}
-
-static void RunDoneInAnotherThread(google::protobuf::Closure* done) {
-    bthread_t bh;
-    bthread_attr_t attr = (FLAGS_usercode_in_pthread ?
-                           BTHREAD_ATTR_PTHREAD : BTHREAD_ATTR_NORMAL);
-    if (bthread_start_background(&bh, &attr, RunDone, done) != 0) {
-        LOG(FATAL) << "Fail to start bthread";
-        done->Run();
-    }
-}
-
-void RunDoneByState(Controller* cntl,
-                    google::protobuf::Closure* done) {
-    if (done) {
-        if (cntl->_run_done_state == Controller::CALLMETHOD_CAN_RUN_DONE) {
-            cntl->_run_done_state = Controller::CALLMETHOD_DID_RUN_DONE;
-            done->Run();
-        } else {
-            RunDoneInAnotherThread(done);
-        }
-    }
-}
-
 void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
                          google::protobuf::RpcController* controller_base,
                          const google::protobuf::Message* request,
@@ -278,25 +266,36 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         // in correlation_id. negative max_retry causes undefined behavior.
         cntl->set_max_retry(0);
     }
+    // HTTP needs this field to be set before any SetFailed()
+    cntl->_request_protocol = _options.protocol;
+    cntl->_preferred_index = _preferred_index;
     cntl->_retry_policy = _options.retry_policy;
     const CallId correlation_id = cntl->call_id();
     const int rc = bthread_id_lock_and_reset_range(
                     correlation_id, NULL, 2 + cntl->max_retry());
     if (rc != 0) {
         CHECK_EQ(EINVAL, rc);
-        const int err = cntl->ErrorCode();
-        if (err != ECANCELED) {
-            // it's very likely that user reused a un-Reset() Controller.
-            cntl->SetFailed((err ? err : EINVAL), "call_id=%" PRId64 " was "
-                            "destroyed before CallMethod(), did you forget to "
-                            "Reset() the Controller?",
+        if (!cntl->FailedInline()) {
+            cntl->SetFailed(EINVAL, "Fail to lock call_id=%" PRId64,
                             correlation_id.value);
-        } else { 
-            // not warn for canceling which is common.
         }
-        RunDoneByState(cntl, done);
+        LOG_IF(ERROR, cntl->is_used_by_rpc())
+            << "Controller=" << cntl << " was used by another RPC before. "
+            "Did you forget to Reset() it before reuse?";
+        // Have to run done in-place. If the done runs in another thread,
+        // Join() on this RPC is no-op and probably ends earlier than running
+        // the callback and releases resources used in the callback.
+        // Since this branch is only entered by wrongly-used RPC, the
+        // potentially introduced deadlock(caused by locking RPC and done with
+        // the same non-recursive lock) is acceptable and removable by fixing
+        // user's code.
+        if (done) {
+            done->Run();
+        }
         return;
     }
+    cntl->set_used_by_rpc();
+
     if (cntl->_sender == NULL && IsTraceable(Span::tls_parent())) {
         const int64_t start_send_us = butil::cpuwide_time_us();
         const std::string* method_name = NULL;
@@ -340,8 +339,6 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         cntl->_single_server_id = _server_id;
         cntl->_remote_side = _server_address;
     }
-    cntl->_request_protocol = _options.protocol;
-    cntl->_preferred_index = _preferred_index;
 
     // Share the lb with controller.
     cntl->_lb = _lb;
@@ -351,6 +348,11 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
         TooManyUserCode()) {
         cntl->SetFailed(ELIMIT, "Too many user code to run when "
                         "-usercode_in_pthread is on");
+        return cntl->HandleSendFailed();
+    }
+    if (cntl->FailedInline()) {
+        // probably failed before RPC, not called until all necessary
+        // parameters in `cntl' are set.
         return cntl->HandleSendFailed();
     }
     _serialize_request(&cntl->_request_buf, cntl, request);
@@ -439,23 +441,9 @@ int Channel::CheckHealth() {
         return -1;
     } else {
         SocketUniquePtr tmp_sock;
-        LoadBalancer::SelectIn sel_in = { 0, false, 0, NULL };
+        LoadBalancer::SelectIn sel_in = { 0, false, false, 0, NULL };
         LoadBalancer::SelectOut sel_out(&tmp_sock);
-        const int rc = _lb->SelectServer(sel_in, &sel_out);
-        if (rc != 0) {
-            return rc;
-        }
-        if (sel_out.need_feedback) {
-            LoadBalancer::CallInfo info;
-            info.in.begin_time_us = 0;
-            info.in.has_request_code = false;
-            info.in.request_code = 0;
-            info.in.excluded = NULL;
-            info.server_id = tmp_sock->id();
-            info.error_code = ECANCELED;
-            _lb->Feedback(info);
-        }
-        return 0;
+        return _lb->SelectServer(sel_in, &sel_out);
     }
 }
 

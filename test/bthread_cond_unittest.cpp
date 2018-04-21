@@ -97,7 +97,7 @@ TEST(CondTest, sanity) {
         long delta = wake_time[i] - last_time - SIGNAL_INTERVAL_US;
         EXPECT_GT(wake_time[i], last_time);
         square_sum += delta * delta;
-        EXPECT_LT(labs(delta), 2000L) << "error[" << i << "]=" << delta << "="
+        EXPECT_LT(labs(delta), 10000L) << "error[" << i << "]=" << delta << "="
             << wake_time[i] << " - " << last_time;
     }
     printf("Average error is %fus\n", sqrt(square_sum / std::max(nbeforestop, 1UL)));
@@ -108,8 +108,6 @@ TEST(CondTest, sanity) {
         ++count[wake_tid[i]];
     }
     EXPECT_EQ(NW, count.size());
-    for (size_t i = 0; i < NW; ++i) {
-    }
     int avg_count = (int)(wake_tid.size() / count.size());
     for (std::map<bthread_t, int>::iterator
              it = count.begin(); it != count.end(); ++it) {
@@ -117,7 +115,7 @@ TEST(CondTest, sanity) {
             << "bthread=" << it->first
             << " count=" << it->second
             << " avg=" << avg_count;
-        printf("%lu wakes up %d times\n", it->first, it->second);
+        printf("%" PRId64 " wakes up %d times\n", it->first, it->second);
     }
 
     bthread_cond_destroy(&a.c);

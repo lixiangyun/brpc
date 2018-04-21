@@ -37,7 +37,7 @@
 #include "brpc/global.h"
 #include "brpc/socket_map.h"                   // SocketMapList
 #include "brpc/acceptor.h"                     // Acceptor
-#include "brpc/details/ssl_helper.h"           // CreateSSLContext
+#include "brpc/details/ssl_helper.h"           // CreateServerSSLContext
 #include "brpc/protocol.h"                     // ListProtocols
 #include "brpc/nshead_service.h"               // NsheadService
 #include "brpc/builtin/bad_method_service.h"   // BadMethodService
@@ -80,7 +80,7 @@ inline std::ostream& operator<<(std::ostream& os, const timeval& tm) {
 }
 
 extern "C" {
-void* bthread_get_assigned_data() __THROW;
+void* bthread_get_assigned_data();
 }
 
 namespace brpc {
@@ -98,7 +98,7 @@ const char* status_str(Server::Status s) {
     return "UNKNOWN_STATUS";
 }
 
-butil::static_atomic<int> g_running_server_count = BASE_STATIC_ATOMIC_INIT(0);
+butil::static_atomic<int> g_running_server_count = BUTIL_STATIC_ATOMIC_INIT(0);
 
 DEFINE_bool(reuse_addr, true, "Bind to ports in TIME_WAIT state");
 BRPC_VALIDATE_GFLAG(reuse_addr, PassValidate);
@@ -115,14 +115,6 @@ const int INITIAL_CERT_MAP = 64;
 // NOTE: never make s_ncore extern const whose ctor seq against other
 // compilation units is undefined.
 const int s_ncore = sysconf(_SC_NPROCESSORS_ONLN);
-
-SSLOptions::SSLOptions()
-    : strict_sni(false)
-    , disable_ssl3(true)
-    , session_lifetime_s(300)
-    , session_cache_size(20480)
-    , ecdhe_curve_name("prime256v1")
-{}
 
 ServerOptions::ServerOptions()
     : idle_timeout_sec(-1)
@@ -646,6 +638,15 @@ struct RevertServerStatus {
     }
 };
 
+static int get_port_from_fd(int fd) {
+    struct sockaddr_in addr;
+    socklen_t size = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*)&addr, &size) < 0) {
+        return -1;
+    }
+    return ntohs(addr.sin_port);
+}
+
 int Server::StartInternal(const butil::ip_t& ip,
                           const PortRange& port_range,
                           const ServerOptions *opt) {
@@ -877,6 +878,15 @@ int Server::StartInternal(const butil::ip_t& ip,
             }
             return -1;
         }
+        if (_listen_addr.port == 0) {
+            // port=0 makes kernel dynamically select a port from
+            // https://en.wikipedia.org/wiki/Ephemeral_port
+            _listen_addr.port = get_port_from_fd(sockfd);
+            if (_listen_addr.port <= 0) {
+                LOG(ERROR) << "Fail to get port from fd=" << sockfd;
+                return -1;
+            }
+        }
         if (_am == NULL) {
             _am = BuildAcceptor();
             if (NULL == _am) {
@@ -904,6 +914,12 @@ int Server::StartInternal(const butil::ip_t& ip,
         if (_options.internal_port  == _listen_addr.port) {
             LOG(ERROR) << "ServerOptions.internal_port=" << _options.internal_port
                        << " is same with port=" << _listen_addr.port << " to Start()";
+            return -1;
+        }
+        if (_options.internal_port == 0) {
+            LOG(ERROR) << "ServerOptions.internal_port cannot be 0, which"
+                " allocates a dynamic and probabaly unfiltered port,"
+                " against the purpose of \"being internal\".";
             return -1;
         }
         butil::EndPoint internal_point = _listen_addr;
@@ -1621,7 +1637,7 @@ static pthread_mutex_t g_dummy_server_mutex = PTHREAD_MUTEX_INITIALIZER;
 static Server* g_dummy_server = NULL;
 
 int StartDummyServerAt(int port, ProfilerLinker) {
-    if (port <= 0 || port >= 65536) {
+    if (port < 0 || port >= 65536) {
         LOG(ERROR) << "Invalid port=" << port;
         return -1;
     }
@@ -1714,8 +1730,8 @@ int Server::AddCertificate(const CertInfo& cert) {
 
     SSLContext ssl_ctx;
     ssl_ctx.filters = cert.sni_filters;
-    ssl_ctx.ctx = CreateSSLContext(cert.certificate, cert.private_key,
-                                   _options.ssl_options, &ssl_ctx.filters);
+    ssl_ctx.ctx = CreateServerSSLContext(cert.certificate, cert.private_key,
+                                         _options.ssl_options, &ssl_ctx.filters);
     if (ssl_ctx.ctx == NULL) {
         return -1;
     }
@@ -1829,7 +1845,7 @@ int Server::ResetCertificates(const std::vector<CertInfo>& certs) {
 
         SSLContext ssl_ctx;
         ssl_ctx.filters = certs[i].sni_filters;
-        ssl_ctx.ctx = CreateSSLContext(
+        ssl_ctx.ctx = CreateServerSSLContext(
             certs[i].certificate, certs[i].private_key,
             _options.ssl_options, &ssl_ctx.filters);
         if (ssl_ctx.ctx == NULL) {

@@ -30,6 +30,7 @@
 #include "bvar/bvar.h"
 #include "butil/containers/case_ignored_flat_map.h"  // [CaseIgnored]FlatMap
 #include "brpc/controller.h"                   // brpc::Controller
+#include "brpc/ssl_option.h"                   // ServerSSLOptions
 #include "brpc/describable.h"                  // User often needs this
 #include "brpc/data_factory.h"                 // DataFactory
 #include "brpc/builtin/tabbed.h"
@@ -49,77 +50,6 @@ class SimpleDataPool;
 class MongoServiceAdaptor;
 class RestfulMap;
 class RtmpService;
-
-struct CertInfo {
-    // Certificate in PEM format.
-    // Note that CN and alt subjects will be extracted from the certificate,
-    // and will be used as hostnames. Requests to this hostname (provided SNI
-    // extension supported) will be encrypted using this certifcate. 
-    // Supported both file path and raw string
-    std::string certificate;
-
-    // Private key in PEM format.
-    // Supported both file path and raw string based on prefix:
-    std::string private_key;
-        
-    // Additional hostnames besides those inside the certificate. Wildcards
-    // are supported but it can only appear once at the beginning (i.e. *.xxx.com).
-    std::vector<std::string> sni_filters;
-};
-
-struct SSLOptions {
-    // Constructed with default options
-    SSLOptions();
-
-    // Default certificate which will be loaded into server. Requests
-    // without hostname or whose hostname doesn't have a corresponding
-    // certificate will use this certificate. MUST be set to enable SSL.
-    CertInfo default_cert;
-    
-    // Additional certificates which will be loaded into server. These
-    // provide extra bindings between hostnames and certificates so that
-    // we can choose different certificates according to different hostnames.
-    // See `CertInfo' for detail.
-    std::vector<CertInfo> certs;
-
-    // When set, requests without hostname or whose hostname can't be found in
-    // any of the cerficates above will be dropped. Otherwise, `default_cert'
-    // will be used.
-    // Default: false
-    bool strict_sni;
-
-    // When set, SSLv3 requests will be dropped. Strongly recommended since
-    // SSLv3 has been found suffering from severe security problems. Note that
-    // some old versions of browsers may use SSLv3 by default such as IE6.0
-    // Default: true
-    bool disable_ssl3;
-
-    // Maximum lifetime for a session to be cached inside OpenSSL in seconds.
-    // A session can be reused (initiated by client) to save handshake before
-    // it reaches this timeout.
-    // Default: 300
-    int session_lifetime_s;
-
-    // Maximum number of cached sessions. When cache is full, no more new
-    // session will be added into the cache until SSL_CTX_flush_sessions is
-    // called (automatically by SSL_read/write). A special value is 0, which
-    // means no limit.
-    // Default: 20480
-    int session_cache_size;
-
-    // Cipher suites allowed for each SSL handshake. The format of this string
-    // should follow that in `man 1 cipers'. If empty, OpenSSL will choose
-    // a default cipher based on the certificate information
-    // Default: ""
-    std::string ciphers;
-
-    // Name of the elliptic curve used to generate ECDH ephemerial keys
-    // Default: prime256v1
-    std::string ecdhe_curve_name;
-    
-    // TODO: Support NPN & ALPN
-    // TODO: Support OSCP stapling
-};
 
 struct ServerOptions {
     // Constructed with default options.
@@ -241,7 +171,7 @@ struct ServerOptions {
     // Provide builtin services at this port rather than the port to Start().
     // When your server needs to be accessed from public (including traffic
     // redirected by nginx or other http front-end servers), set this port
-    // to a port number that's ONLY accessible from Baidu's internal network
+    // to a port number that's ONLY accessible from internal network
     // so that you can check out the builtin services from this port while
     // hiding them from public. Setting this option also enables security
     // protection code which we may add constantly.
@@ -260,8 +190,8 @@ struct ServerOptions {
     // Enable more secured code which protects internal information from exposure.
     bool security_mode() const { return internal_port >= 0 || !has_builtin_services; }
 
-    // SSL related options. Refer to `SSLOptions' for details
-    SSLOptions ssl_options;
+    // SSL related options. Refer to `ServerSSLOptions' for details
+    ServerSSLOptions ssl_options;
     
     // [CAUTION] This option is for implementing specialized http proxies,
     // most users don't need it. Don't change this option unless you fully
@@ -376,7 +306,7 @@ public:
     struct MethodProperty {
         bool is_builtin_service;
         bool own_method_status;
-        // Parameters which have nothing to with management of services, but
+        // Parameters which have nothing to do with management of services, but
         // will be used when the service is queried.
         struct OpaqueParams {
             bool is_tabbed;
@@ -409,28 +339,25 @@ public:
     Server(ProfilerLinker = ProfilerLinker());
     ~Server();
 
-    // Start this server. Use default options if `opt' is NULL.
-    // This function can be called multiple times if the server is completely
-    // stopped by Stop() and Join().
+    // A set of functions to start this server.
     // Returns 0 on success, -1 otherwise and errno is set appropriately.
+    // Notes:
+    // * Default options are taken if `opt' is NULL.
+    // * A server can be started more than once if the server is completely
+    //   stopped by Stop() and Join().
+    // * port can be 0, which makes kernel to choose a port dynamically.
     
-    // Start on a single address "0.0.0.0:8000".
+    // Start on an address in form of "0.0.0.0:8000".
     int Start(const char* ip_port_str, const ServerOptions* opt);
-
+    int Start(const butil::EndPoint& ip_port, const ServerOptions* opt);
     // Start on IP_ANY:port.
     int Start(int port, const ServerOptions* opt);
-    
-    // Start on ip:port enclosed in butil::EndPoint which is defined in
-    // src/butil/endpoint.h
-    int Start(const butil::EndPoint& ip_port, const ServerOptions* opt);
+    // Start on `ip_str' + any useable port in `range'
+    int Start(const char* ip_str, PortRange range, const ServerOptions *opt);
 
-    // Start on `ip_str' + any useable port in `port_range'
-    int Start(const char* ip_str, PortRange port_range,
-              const ServerOptions *opt);
-
-    // NOTE: Stop() is paired with Join() to stop a server with minimum lost
-    // of requests. The point of separating them is that you can Stop() 
-    // multiple servers before Join()-ing them, the total time to Join is 
+    // NOTE: Stop() is paired with Join() to stop a server without losing
+    // requests. The point of separating them is that you can Stop() multiple
+    // servers before Join() them, in which case the total time to Join is
     // time of the slowest Join(). Otherwise you have to Join() them one by
     // one, in which case the total time is sum of all Join().
 
